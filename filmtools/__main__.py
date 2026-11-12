@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .loader import load_team
+from .loader import load_team, read_roster
 from .report import build_report
 
 CSV_COLS = ["GAME_NUM", "GAME", "GAME_DATE", "PLAY #", "QTR", "SIDE", "DN", "DIST", "DD", "YARD LN", "YDS_TO_GOAL",
@@ -37,7 +37,8 @@ def cmd_report(args) -> None:
     out_dir = Path(args.out) if args.out else team_dir / "_scouting"
     out_dir.mkdir(parents=True, exist_ok=True)
     report = build_report(plays, games, team, out_dir / f"{team} Scouting Report.html",
-                          read_text(out_dir / "notes.md"), read_text(out_dir / "gameplan.md"))
+                          read_text(out_dir / "notes.md"), read_text(out_dir / "gameplan.md"),
+                          read_roster(team_dir))
     plays[[c for c in CSV_COLS if c in plays]].to_csv(out_dir / f"{team} plays.csv", index=False)
     print(f"{len(games)} games, {len(plays)} snaps")
     print("Report:", report)

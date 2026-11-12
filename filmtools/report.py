@@ -37,7 +37,7 @@ class Ctx:
 
     def __init__(self, out_dir: Path, games: list[GameInfo]):
         self.out_dir = out_dir
-        self.labels = {i: g.opponent[:3].upper() for i, g in enumerate(games, 1)}
+        self.labels = {i: re.sub(r"[^A-Za-z]", "", g.opponent)[:3].upper() for i, g in enumerate(games, 1)}
 
     def clip(self, row) -> str:
         label = f"{self.labels.get(row['GAME_NUM'], '?')}-{int(row['PLAY #'])}"
@@ -148,6 +148,7 @@ def offense_section(o: pd.DataFrame, ctx: Ctx, team: str) -> str:
         ("Success rate", pct(succ.sum(), len(succ)), "40% / 60% / 100% of distance"),
         ("Explosive plays", str(int(s["EXPLOSIVE"].sum())), "run 10+ / pass 15+"),
     ])]
+    parts.append(likelihood_block(o, ctx))
 
     # Play families
     fam = group_stats(o, "PLAY_FAMILY")
@@ -175,6 +176,12 @@ def offense_section(o: pd.DataFrame, ctx: Ctx, team: str) -> str:
           pct(r["succ"] * 100, 100) if r["succ"] is not None else "–", ctx.clips(r["g"], 8)] for r in raw],
         numeric_cols=(1, 2, 3))))
 
+    kp = key_players(o, ctx)
+    if kp:
+        parts.append(sub("Key players (jersey #)", kp,
+                         "From the jersey numbers Hudl tagged on each snap - not every snap has them, so counts "
+                         "are a floor. Confirm numbers on film."))
+
     # Down & distance
     dd = group_stats(o, "DD", order=DD_ORDER)
     parts.append(sub("Down & distance", table(
@@ -187,11 +194,13 @@ def offense_section(o: pd.DataFrame, ctx: Ctx, team: str) -> str:
     fm = group_stats(o, "FORM_FAMILY")
     mx = max((r["n"] for r in fm), default=1)
     parts.append(sub("Formations", table(
-        ["Formation", "Snaps", "Run %", "Top calls", "Avg gain", "Success"],
+        ["Formation", "Snaps", "Run %", "Top calls", "Avg gain", "Success", "Tagged in"],
         [[esc(r["key"]), bar(r["n"], mx, str(r["n"])), f"{r['run_pct'] * 100:.0f}%", top_calls(r["g"]),
-          num(r["avg"]), pct(r["succ"] * 100, 100) if r["succ"] is not None else "–"] for r in fm],
+          num(r["avg"]), pct(r["succ"] * 100, 100) if r["succ"] is not None else "–",
+          esc(", ".join(ctx.labels[n] for n in sorted(r["g"]["GAME_NUM"].unique())))] for r in fm],
         numeric_cols=(2, 4, 5)),
-        "Left/Right/Open dropped so mirrored sets group together. Pistol is kept separate from the gun sets."))
+        "Left/Right/Open dropped so mirrored sets group together. Pistol is kept separate from the gun sets. "
+        "Different games may be tagged by different staffs with different formation names - see 'Tagged in'."))
 
     # Formation x play family
     ct = pd.crosstab(o["FORM_FAMILY"], o["PLAY_FAMILY"])
@@ -238,6 +247,180 @@ def offense_section(o: pd.DataFrame, ctx: Ctx, team: str) -> str:
     big = o[o["EXPLOSIVE"] | o["IS_TURNOVER"]].sort_values(["GAME_NUM", "PLAY #"])
     parts.append(sub("Explosive plays & turnovers", play_list(big, ctx)))
     return section(f"{team} offense", "Defense - DL, LB, DB", "".join(parts), "offense")
+
+
+def coverage_block(d: pd.DataFrame, ctx: Ctx) -> str:
+    if "FILM_COVERAGE" not in d or d["FILM_COVERAGE"].notna().sum() == 0:
+        return ""
+    snaps = d[d["KIND"].notna()]
+    tagged = snaps[snaps["FILM_COVERAGE"].notna()]
+    read = tagged[tagged["FILM_COVERAGE"] != "?"]
+    out = [tiles([
+        ("Snaps reviewed on film", f"{len(tagged)} / {len(snaps)}",
+         ", ".join(f"{ctx.labels[n]} {c}" for n, c in tagged.groupby("GAME_NUM").size().items())),
+        ("Readable", str(len(read)), f"{len(tagged) - len(read)} clips not readable"),
+        ("Single-high shell", pct((read["FILM_SHELL"] == "1-high").sum(), len(read)), "of readable snaps"),
+        ("Two-high shell", pct((read["FILM_SHELL"] == "2-high").sum(), len(read)), "of readable snaps"),
+    ])]
+    rows = []
+    for (shell, cv), g in read.groupby(["FILM_SHELL", "FILM_COVERAGE"], dropna=False):
+        s = g[g["SCRIMMAGE"]]
+        rows.append([esc(shell), esc(cv), str(len(g)), f"{(g['KIND'] == 'Pass').sum()} / {(g['KIND'] == 'Run').sum()}",
+                     num(s["GAIN"].mean()), esc(", ".join(sorted(g["FILM_CONF"].dropna().unique()))),
+                     ctx.clips(g.sort_values(["GAME_NUM", "PLAY #"]), 10)])
+    rows.sort(key=lambda r: -int(r[2]))
+    out.append(table(["Shell", "Coverage", "Snaps", "Pass / Run", "Avg gain", "Confidence", "Clips"], rows,
+                     numeric_cols=(2, 4)))
+    rows = []
+    for dd in DD_ORDER:
+        g = read[read["DD"] == dd]
+        if len(g):
+            vc = g["FILM_COVERAGE"].value_counts()
+            rows.append([esc(dd), str(len(g)), esc(", ".join(f"{k} {v}" for k, v in vc.items()))])
+    out.append("<h4>By down & distance</h4>" + table(["Situation", "Snaps read", "Coverage seen"], rows, numeric_cols=(1,)))
+    return "".join(out)
+
+
+def roster_section(roster: pd.DataFrame, p: pd.DataFrame, team: str) -> str:
+    if roster.empty:
+        return ""
+    seen: dict[int, set] = {}
+    if "FILM_PLAYERS" in p:
+        for entry in p["FILM_PLAYERS"].dropna():
+            for part in str(entry).split(";"):
+                m = re.match(r"\s*(.*?)\s*#(\d+)\s*$", part)
+                if m:
+                    seen.setdefault(int(m.group(2)), set()).add(m.group(1) or "seen")
+    for n, role in roster.attrs.get("staff", {}).items():
+        seen.setdefault(n, set()).add(f"{role} (confirmed)")
+    rows = []
+    for _, r in roster.sort_values("NO").iterrows():
+        pos = r["POS"]
+        two_way = any(x in pos for x in ("DL", "DE", "LB", "DB")) and any(x in pos for x in ("OL", "TE", "RB", "WR", "QB"))
+        wt = "" if pd.isna(r["WT"]) else str(int(r["WT"]))
+        flag = []
+        if not pd.isna(r["WT"]) and r["WT"] >= 300:
+            flag.append("300+ lb")
+        if two_way:
+            flag.append("two-way")
+        film_note = ", ".join(sorted(seen.get(int(r["NO"]), [])))
+        rows.append([f"#{int(r['NO'])}", esc(r["NAME"]), esc(pos), esc(r["GR"]), esc(r["HT"]), wt, esc(", ".join(flag)),
+                     esc(film_note)])
+    body = table(["#", "Name", "Pos.", "Gr.", "Ht.", "Wt.", "Notes", "Seen on film as"], rows, numeric_cols=(5,))
+    return section(f"{team} roster", "All position groups", sub(
+        "Roster", body, "From the roster file in the opponent folder. 'Seen on film as' comes from film_tags.csv "
+                        "and staff-confirmed positions in _scouting/positions.txt."),
+        "roster")
+
+
+def _lean_cell(r: dict | None) -> str:
+    """'RUN 10/10' style cell, shaded by confidence."""
+    if not r or not r["n"]:
+        return '<span class="muted">–</span>'
+    side = r["expect"].upper()
+    label = f"{side} {r['runs'] if side == 'RUN' else r['passes']}/{r['n']}"
+    cls = {"strong": "lk strong", "lean": "lk lean", "balanced": "lk bal", "small": "lk small"}[r["conf"]]
+    kind = "run" if side == "RUN" else "pass"
+    return f'<span class="{cls} {kind}" title="{r["conf"]}">{esc(label)}</span>'
+
+
+def _lean_rows(items: list[dict], ctx: Ctx, df: pd.DataFrame, col: str) -> list[list[str]]:
+    rows = []
+    for r in items:
+        g = df[df[col] == r["key"]].sort_values(["GAME_NUM", "PLAY #"])
+        rows.append([esc(r["key"]), str(r["n"]), bar(r["run_pct"] or 0, 1, f"{100 * (r['run_pct'] or 0):.0f}% run"),
+                     _lean_cell(r), esc(r["conf"]), num(r["avg"]), top_calls(g), ctx.clips(g, 8)])
+    return rows
+
+
+def likelihood_block(o: pd.DataFrame, ctx: Ctx) -> str:
+    from . import tendencies as T
+    t = T.offense_snaps(o)
+    if t.empty:
+        return ""
+    heads = ["Situation", "Snaps", "Run %", "Expect", "Confidence", "Avg gain", "Top calls", "Clips"]
+    legend = ('<p class="note">Expect = the more likely call and how often it happened. Confidence: '
+              '<b>strong</b> = 85%+ one way on 6+ snaps; <b>lean</b> = 75%+ on 4+ snaps; '
+              '<b>balanced</b> = no 75% side; <b>small</b> = fewer than 4 snaps, not a tendency.</p>')
+    html_parts = [legend]
+    html_parts.append("<h4>By down</h4>" + table(heads, _lean_rows(T.by_down(t), ctx, t, "DOWN"), numeric_cols=(1, 5)))
+    html_parts.append("<h4>By down &amp; distance</h4>"
+                      + table(heads, _lean_rows(T.by_dd(t, DD_ORDER), ctx, t, "DD"), numeric_cols=(1, 5)))
+    html_parts.append("<h4>By formation group</h4>"
+                      + table(heads, _lean_rows(T.by_group(t), ctx, t, "FGROUP"), numeric_cols=(1, 5))
+                      + '<p class="note">Formation groups: ' + esc("; ".join(
+                          f"{k}: {', '.join(sorted(g['FORMATION'].dropna().str.title().unique()))}"
+                          for k, g in t.groupby("FGROUP"))) + "</p>")
+    downs, grid = T.group_by_down(t)
+    rows = [[esc(k), str(n)] + [_lean_cell(c) for c in cells] for k, n, cells in grid]
+    html_parts.append("<h4>Formation × down</h4>" + table(["Formation group", "Snaps"] + downs, rows, numeric_cols=(1,)))
+    pdowns, ptypes = T.play_type_by_down(t)
+    if ptypes:
+        tagged = t[t["PLAY_FAMILY"].notna()]
+        games = ", ".join(f"{ctx.labels[g]} {int((tagged['GAME_NUM'] == g).sum())}/{int((t['GAME_NUM'] == g).sum())}"
+                          for g in sorted(t["GAME_NUM"].unique()) if (tagged["GAME_NUM"] == g).any())
+        rows = []
+        for k, g, counts in ptypes:
+            sc = g[g["SCRIMMAGE"]]
+            succ = sc["SUCCESS"].dropna()
+            rows.append([esc(k), str(len(g))] + [str(c) if c else '<span class="muted">–</span>' for c in counts]
+                        + [num(sc["GAIN"].mean()), pct(int(succ.sum()), len(succ)) if len(succ) else "–",
+                           ctx.clips(g.sort_values(["GAME_NUM", "PLAY #"]), 8)])
+        html_parts.append("<h4>Play type × down</h4>"
+                          f'<p class="note">Only snaps with a play call tagged ({esc(games)} tagged / called).</p>'
+                          + table(["Play type", "Calls"] + pdowns + ["Avg gain", "Success", "Clips"], rows,
+                                  numeric_cols=tuple(range(1, len(pdowns) + 4))))
+    rz = T.red_zone(t)
+    if rz["all"]["n"]:
+        z = rz["snaps"].sort_values(["GAME_NUM", "PLAY #"])
+        tops = ", ".join(f"{esc(k)} {v}" for k, v in rz["plays"].head(5).items())
+        html_parts.append(
+            "<h4>Red zone (inside the 20)</h4>"
+            + tiles([("Red-zone snaps", str(rz["all"]["n"]), f"{rz['all']['runs']} run / {rz['all']['passes']} pass"),
+                     ("Run %", pct(rz["all"]["runs"], rz["all"]["n"]), rz["all"]["conf"]),
+                     ("Inside the 10", f"{rz['inside10']['n']} snaps",
+                      f"{pct(rz['inside10']['runs'], rz['inside10']['n'])} run"),
+                     ("TDs", str(int(z["IS_TD"].sum())), "rushing + passing")])
+            + f'<p class="note">Most-called: {tops}</p>'
+            + "<h4>Red zone by down</h4>" + table(heads, _lean_rows(rz["by_down"], ctx, z, "DOWN"), numeric_cols=(1, 5))
+            + "<h4>Red zone by formation group</h4>" + table(heads, _lean_rows(rz["by_group"], ctx, z, "FGROUP"), numeric_cols=(1, 5))
+            + "<h4>Every red-zone snap</h4>" + play_list(z, ctx))
+    return sub("Run / pass likelihood", "".join(html_parts),
+               "What to expect by down, formation and field position. Built for the defensive call sheet.")
+
+
+def key_players(o: pd.DataFrame, ctx: Ctx) -> str:
+    s = o[o["SCRIMMAGE"]]
+    blocks = []
+    runs = s[(s["KIND"] == "Run") & s["RUSHER_NO"].notna()]
+    if len(runs):
+        rows = []
+        for no, g in sorted(runs.groupby("RUSHER_NO"), key=lambda kv: -len(kv[1]))[:6]:
+            rows.append([f"#{no}", str(len(g)), num(g["GAIN"].sum(), 0), num(g["GAIN"].mean()),
+                         num(g["GAIN"].max(), 0), str(int(g["IS_TD"].sum())), ctx.clips(g.sort_values("GAIN", ascending=False), 6)])
+        blocks.append("<h4>Ball carriers</h4>" + table(["#", "Carries", "Yds", "Avg", "Long", "TD", "Best runs"], rows,
+                                                       numeric_cols=(1, 2, 3, 4, 5)))
+    passes = s[(s["KIND"] == "Pass") & s["PASSER_NO"].notna()]
+    if len(passes):
+        rows = []
+        for no, g in sorted(passes.groupby("PASSER_NO"), key=lambda kv: -len(kv[1]))[:3]:
+            comp = g["RESULT"].str.contains("Complete").sum()
+            att = g["RESULT"].str.contains("Complete|Incomplete|Interception").sum()
+            rows.append([f"#{no}", str(len(g)), f"{comp}/{att}", num(g["GAIN"].sum(), 0),
+                         str(int(g["RESULT"].str.contains("Interception").sum())),
+                         str(int(g["RESULT"].str.contains("Scramble").sum())), str(int(g["RESULT"].str.contains("Sack").sum()))])
+        blocks.append("<h4>Passers</h4>" + table(["#", "Dropbacks", "Comp/Att", "Yds", "INT", "Scrambles", "Sacks"], rows,
+                                                 numeric_cols=(1, 2, 3, 4, 5, 6)))
+    tg = s[s["RECEIVER_NO"].notna()]
+    if len(tg):
+        rows = []
+        for no, g in sorted(tg.groupby("RECEIVER_NO"), key=lambda kv: -len(kv[1]))[:6]:
+            caught = g[g["RESULT"].str.contains("Complete")]
+            rows.append([f"#{no}", str(len(g)), str(len(caught)), num(caught["GAIN"].sum(), 0),
+                         num(caught["GAIN"].max(), 0), ctx.clips(g, 6)])
+        blocks.append("<h4>Targets</h4>" + table(["#", "Targets", "Catches", "Yds", "Long", "Clips"], rows,
+                                                 numeric_cols=(1, 2, 3, 4)))
+    return "".join(blocks)
 
 
 def by_game(df: pd.DataFrame, ctx: Ctx) -> str:
@@ -298,6 +481,12 @@ def defense_section(d: pd.DataFrame, ctx: Ctx, team: str) -> str:
           ctx.clips(r["g"], 8)] for r in fm],
         numeric_cols=(2, 3, 4, 5, 6)),
         "Formation names are Hudl's tags for the opponent's offense (e.g. Kings/Queens = that tagger's labels)."))
+
+    cov = coverage_block(d, ctx)
+    if cov:
+        parts.append(sub("Coverage & fronts (tagged from film)", cov,
+                         "Hudl doesn't tag the defense, so these are read from the film (film_tags.csv). "
+                         "Confidence is shown per snap; '?' = clip not readable. Treat small counts as a lean, not a rule."))
 
     rows = []
     for kind in ("Run", "Pass"):
@@ -446,6 +635,21 @@ def md_to_html(text: str, ctx: Ctx, base_level: int = 3) -> str:
     return "".join(out)
 
 
+# ---------------------------------------------------------------- opponent playbook
+def playbook_section(p: pd.DataFrame, games: list[GameInfo], team: str, out_path: Path) -> str:
+    from . import playbook as PB
+    try:
+        pb = PB.render(out_path.parent.parent, p, games, out_path.parent)
+    except Exception as e:   # never lose the whole report over the playbook
+        return section(f"{team} offensive playbook", "Defense - scout team", f'<p class="callout">Playbook failed: {esc(e)}</p>', "playbook")
+    secs = "".join(f'<h3 id="pb-{k}">{t} <span class="note">({n} cards)</span></h3>{h}' for k, (t, n, h) in pb["sections"].items())
+    body = (f'<div class="pb">{pb["intro"]}{pb["legend"]}'
+            f'<h3 id="pb-formations">Formations <span class="note">({pb["n_formations"]})</span></h3>'
+            '<p class="note">Each formation: standard alignment for the tag name, run/pass by down, what they called from it.</p>'
+            f'{pb["formations"]}{secs}</div>')
+    return section(f"{team} offensive playbook", "Defense - scout team", body, "playbook")
+
+
 # ---------------------------------------------------------------- page
 CSS = """
 :root{color-scheme:light;--bg:#fcfcfb;--surface:#ffffff;--ink:#0b0b0b;--ink2:#52514e;--muted:#8a8984;--line:#e4e3de;
@@ -475,14 +679,22 @@ th{color:var(--ink2);font-weight:600;background:var(--bg);position:sticky;top:0}
 .heat{display:inline-block;min-width:28px;padding:2px 6px;border-radius:4px;background:rgb(from var(--accent) r g b / var(--a));text-align:center}
 a.clip{color:var(--accent);text-decoration:none;white-space:nowrap;font-variant-numeric:tabular-nums}a.clip:hover{text-decoration:underline}
 ul.facts li{margin:4px 0}
+.lk{display:inline-block;padding:1px 8px;border-radius:999px;font-weight:600;font-size:12px;white-space:nowrap;border:1px solid var(--line)}
+.lk.run.strong{background:#2a78d6;color:#fff}.lk.run.lean{background:#2a78d633;color:var(--ink)}
+.lk.pass.strong{background:#eb6834;color:#fff}.lk.pass.lean{background:#eb683433;color:var(--ink)}
+.lk.bal{background:transparent;color:var(--ink2)}.lk.small{background:transparent;color:var(--muted);font-weight:400}
 .gameplan h3{font-size:18px;margin:24px 0 4px;padding:6px 10px;background:var(--accent-soft);border-radius:6px}
 .gameplan h4{font-size:15px;margin:16px 0 4px}.gameplan li{margin:4px 0}.gameplan ul ul{margin-top:2px}details{margin-top:8px}summary{cursor:pointer;font-weight:600}
 @media print{nav{display:none}section{break-inside:auto}.tablewrap{overflow:visible}a.clip{color:inherit}}
 """
 
 
+from .playbook import CARD_CSS as _PB_CSS, PB_TOKENS as _PB_TOKENS
+PB_STYLE = _PB_TOKENS + _PB_CSS
+
+
 def build_report(p: pd.DataFrame, games: list[GameInfo], team: str, out_path: Path,
-                 notes_md: str = "", gameplan_md: str = "") -> Path:
+                 notes_md: str = "", gameplan_md: str = "", roster: pd.DataFrame | None = None) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ctx = Ctx(out_path.parent, games)
     ctx.index(p)
@@ -492,6 +704,20 @@ def build_report(p: pd.DataFrame, games: list[GameInfo], team: str, out_path: Pa
     game_line = " · ".join(
         f"{g.opponent} ({g.date.strftime('%b %d') if g.date is not None else '?'})" for g in games)
     labels = ", ".join(f"{ctx.labels[i]} = {g.opponent}" for i, g in enumerate(games, 1))
+    rows = []
+    for i, g in enumerate(games, 1):
+        gp = p[p["GAME_NUM"] == i]
+        o = gp[(gp["SIDE"] == "offense") & gp["KIND"].notna()]
+        d = gp[(gp["SIDE"] == "defense") & gp["KIND"].notna()]
+        rows.append([esc(ctx.labels[i]), esc(g.opponent), str(len(g.clips)), esc(g.perspective),
+                     f"{o['PLAY'].notna().sum()} / {o['KIND'].notna().sum()}",
+                     f"{o['FORMATION'].notna().sum()} / {o['KIND'].notna().sum()}",
+                     f"{d['FORMATION'].notna().sum()} / {d['KIND'].notna().sum()}"])
+    data_note = sub("What each game's breakdown contains", table(
+        ["Label", "Opponent", "Clips", "Tagged from", f"{team} play calls", f"{team} formations",
+         "Opp. formations"], rows),
+        "Fractions = snaps with that field tagged / snaps. 'Tagged from' comes from _scouting/tagging.txt; "
+        f"'offense' always means {team} has the ball.")
     facts = "".join(f"<li>{f}</li>" for f in key_facts(p, team))
     appendix = "".join(
         f"<details><summary>{esc(g.opponent)} - all plays</summary>"
@@ -503,18 +729,20 @@ def build_report(p: pd.DataFrame, games: list[GameInfo], team: str, out_path: Pa
 <p>Games scouted: {esc(game_line)}. Built from Hudl breakdowns ({len(p)} tagged snaps).</p>
 <p class="muted">Clip labels: {esc(labels)} - click a label to open that play's video.</p></header>
 <nav><a href="#keys">Key facts</a>{'<a href="#gameplan">Game plan</a>' if gameplan else ''}<a href="#offense">{esc(team)} offense</a><a href="#defense">{esc(team)} defense</a>
-<a href="#special">Special teams</a><a href="#appendix">All plays</a></nav>
+<a href="#special">Special teams</a><a href="#playbook">Offensive playbook</a>{'<a href="#roster">Roster</a>' if roster is not None and not roster.empty else ''}<a href="#appendix">All plays</a></nav>
 <section id="keys"><h2>Key facts</h2><ul class="facts">{facts}</ul>{notes_html}
 <p class="note">Success = gain of 40% of the distance on 1st down, 60% on 2nd, 100% on 3rd/4th. Penalty and timeout rows
-are counted as calls but left out of yardage and success.</p></section>
+are counted as calls but left out of yardage and success.</p>{data_note}</section>
 {gameplan}
 {offense_section(p[p['SIDE'] == 'offense'], ctx, team)}
 {defense_section(p[p['SIDE'] == 'defense'], ctx, team)}
 {special_section(p[p['SIDE'] == 'special'], ctx, team)}
+{playbook_section(p, games, team, out_path)}
+{roster_section(roster if roster is not None else pd.DataFrame(), p, team)}
 <section id="appendix"><h2>All plays</h2>{appendix}</section>
 </main>"""
     doc = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
            f'<meta name="viewport" content="width=device-width,initial-scale=1">'
-           f'<title>{esc(team)} Scouting Report</title><style>{CSS}</style></head><body>{body}</body></html>')
+           f'<title>{esc(team)} Scouting Report</title><style>{CSS}{PB_STYLE}</style></head><body>{body}</body></html>')
     out_path.write_text(doc, encoding="utf-8")
     return out_path

@@ -13,6 +13,13 @@ import pandas as pd
 PLAY_RULES: list[tuple[str, list[str]]] = [
     ("Screen", ["SCREEN"]),
     ("Play-action", ["P/A"]),
+    ("Boot / play-action", ["BOOT"]),
+    ("Trick play", ["REVERSE"]),
+    ("Outside zone / lead", ["OUTSIDE"]),
+    ("Power", ["POWER"]),
+    ("HB Lead", ["LEAD"]),
+    ("End around", ["END AROUND"]),
+    ("Toss", ["TOSS"]),
     ("Buck Sweep", ["BUCK", "SWEEP"]),
     ("Fly Counter", ["FLY", "COUNTER"]),
     ("QB run / option", ["OPTION"]),
@@ -26,8 +33,8 @@ PLAY_RULES: list[tuple[str, list[str]]] = [
 ]
 IGNORE = {"BAD SNAP"}
 # Route strings: digits, or route names like DRAG / SEAM / CURL / POST / VERTS.
-ROUTE_WORDS = {"DRAG", "SEAM", "CURL", "POST", "WHEEL", "DIG", "CORNER", "HITCHES", "VERTS",
-               "SLANT", "OUT", "FLAT", "PIVOT", "HITCH"}
+ROUTE_WORDS = {"DRAG", "SEAM", "SEAMS", "CURL", "POST", "POSTS", "WHEEL", "DIG", "CORNER", "HITCHES", "VERTS",
+               "SLANT", "OUT", "FLAT", "PIVOT", "HITCH", "SWING", "SIT", "SMASH", "SCISSORS", "BALL", "GO"}
 
 
 def play_family(play) -> str | None:
@@ -40,7 +47,7 @@ def play_family(play) -> str | None:
         if all(w in p for w in words):
             return family
     tokens = set(re.split(r"[\s/]+", p))
-    if re.fullmatch(r"[\d\s]+", p) or tokens & ROUTE_WORDS:
+    if re.fullmatch(r"[\d\s]+", p) or tokens & ROUTE_WORDS or any(t.isdigit() for t in tokens):
         return "Dropback pass"
     return p.title()
 
